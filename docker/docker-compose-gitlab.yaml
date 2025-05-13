@@ -1,0 +1,28 @@
+version: '3.9'
+services:
+  gitlab:
+    image: gitlab/gitlab-ee:16.11.10-ee.0
+    container_name: gitlab
+    restart: always
+    hostname: 'gitlab.infra.local'
+    environment:
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://gitlab.infra.local'
+        registry_external_url 'https://gitlab.infra.local:8888'
+        nginx['ssl_certificate'] = "/etc/gitlab/ssl/gitlab.infra.local.crt"
+        nginx['ssl_certificate_key'] = "/etc/gitlab/ssl/gitlab.infra.local.key"
+        nginx['redirect_http_to_https'] = true
+    volumes:
+      - config_volume:/etc/gitlab
+      - data_volume:/var/opt/gitlab
+    networks:
+      infra_network:
+        ipv4_address: 172.20.0.10
+
+networks:
+  infra_network:
+    external: true
+
+volumes:
+  config_volume:
+  data_volume:

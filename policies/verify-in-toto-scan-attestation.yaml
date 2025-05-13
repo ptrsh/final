@@ -1,0 +1,28 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: verify-image-scan-attestation
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+    - name: check-scan-attestation
+      match:
+        any:
+        - resources:
+            kinds:
+              - Pod
+      verifyImages:
+      - imageReferences:
+        - "gitlab.infra.local:5050/*"
+        attestations:
+        - predicateType: "custom.io/scan-report/v1"
+          attestors:
+          - count: 1
+            entries:
+            - keys:
+                publicKeys: |
+                  -----BEGIN PUBLIC KEY-----
+                  MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEZk123abc456def789ghi
+                  jklmnoPqrstuvWxyz0123ABCDEFGHijklmnopQRSTUVWxyz7890====
+                  -----END PUBLIC KEY-----

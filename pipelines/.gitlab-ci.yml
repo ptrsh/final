@@ -1,0 +1,269 @@
+stages:
+  - prepare_layout
+  - attest_checkout
+  - attest_test
+  - attest_build_image
+  - attest_scan_image
+  - sign_image_cosign
+  - publish_image_and_metadata
+  - deploy
+
+variables:
+  IMAGE_NAME: "${CI_REGISTRY_IMAGE}"
+  IMAGE_TAG: "${CI_COMMIT_SHORT_SHA}"
+  FULL_IMAGE_NAME: "${IMAGE_NAME}:${IMAGE_TAG}"
+  CI_ARTIFACTS_DIR: "ci_artifacts"
+  IN_TOTO_METADATA_SUBDIR: "intoto_links"
+  IN_TOTO_LINK_FILES_PATH: "${CI_ARTIFACTS_DIR}/${IN_TOTO_METADATA_SUBDIR}"
+  SIGNED_LAYOUT_FILE: "${CI_ARTIFACTS_DIR}/layout.root.layout"
+  LAYOUT_TEMPLATE_FILE: "layout.template.json"
+  OWNER_KEY_FILE_PATH: "$IN_TOTO_OWNER_PRIVATE_KEY"
+  CHECKOUT_ACTOR_KEY_FILE_PATH: "$IN_TOTO_CHECKOUT_ACTOR_PRIVATE_KEY"
+  UNIT_TEST_ACTOR_KEY_FILE_PATH: "$IN_TOTO_UNIT_TEST_ACTOR_PRIVATE_KEY"
+  BUILD_IMAGE_ACTOR_KEY_FILE_PATH: "$IN_TOTO_BUILD_IMAGE_ACTOR_PRIVATE_KEY"
+  SCAN_IMAGE_ACTOR_KEY_FILE_PATH: "$IN_TOTO_SCAN_IMAGE_ACTOR_PRIVATE_KEY"
+  CHECKOUT_ACTOR_PUBKEY_PATH: "intoto_keys/checkout_actor.pub"
+  UNIT_TEST_ACTOR_PUBKEY_PATH: "intoto_keys/unit_test_actor.pub"
+  BUILD_IMAGE_ACTOR_PUBKEY_PATH: "intoto_keys/build_image_actor.pub"
+  SCAN_IMAGE_ACTOR_PUBKEY_PATH: "intoto_keys/scan_image_actor.pub"
+
+default:
+  image: alpine:3.18
+  before_script:
+    - apk add --no-cache bash git coreutils python3 py3-pip docker-cli
+    - pip3 install in-toto in-toto-provision cryptography
+    - |
+      COSIGN_VERSION="v2.5.0"
+      wget "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -O /usr/local/bin/cosign
+      chmod +x /usr/local/bin/cosign
+    - mkdir -p ${IN_TOTO_LINK_FILES_PATH}
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+
+prepare_layout_job:
+  stage: prepare_layout
+  script:
+    - echo "Signing layout template: ${LAYOUT_TEMPLATE_FILE}"
+    - |
+      if [ ! -f "${LAYOUT_TEMPLATE_FILE}" ]; then
+        echo "ERROR: Layout template file '${LAYOUT_TEMPLATE_FILE}' not found!"
+        exit 1
+      fi
+      if [ ! -f "${OWNER_KEY_FILE_PATH}" ]; then
+        echo "ERROR: Owner private key file not found at '${OWNER_KEY_FILE_PATH}'!"
+        exit 1
+      fi
+    - in-toto-sign -k "${OWNER_KEY_FILE_PATH}" -f "${LAYOUT_TEMPLATE_FILE}" -o "${SIGNED_LAYOUT_FILE}"
+    - echo "Layout signed and saved to ${SIGNED_LAYOUT_FILE}"
+  artifacts:
+    paths:
+      - "${SIGNED_LAYOUT_FILE}"
+    expire_in: 1 week
+
+attest_code_checkout_job:
+  stage: attest_checkout
+  script:
+    - echo "Attesting code checkout for commit ${CI_COMMIT_SHA}"
+    - git rev-parse HEAD > "${IN_TOTO_LINK_FILES_PATH}/commit_id.txt"
+    - |
+      in-toto-run \
+        --step-name "checkout" \
+        --key "${CHECKOUT_ACTOR_KEY_FILE_PATH}" \
+        --materials . \
+        --products . \
+        --metadata-file "${IN_TOTO_LINK_FILES_PATH}/checkout.${CI_COMMIT_SHORT_SHA}.link" \
+        -- git status
+  artifacts:
+    paths:
+      - "${IN_TOTO_LINK_FILES_PATH}/"
+    expire_in: 1 week
+
+attest_unit_tests_job:
+  stage: attest_test
+  script:
+    - pip3 install -r requirements.txt
+    - echo "Running unit tests and creating attestation..."
+    - python3 -m unittest discover -p '*_test.py' || echo "Unit tests failed, proceeding with attestation of attempt."
+    - echo "Unit test execution attempt recorded" > "${IN_TOTO_LINK_FILES_PATH}/test-results-summary.txt"
+    - |
+      in-toto-run \
+        --step-name "unit-tests" \
+        --key "${UNIT_TEST_ACTOR_KEY_FILE_PATH}" \
+        --materials app.py requirements.txt \
+        --products "${IN_TOTO_LINK_FILES_PATH}/test-results-summary.txt" \
+        --metadata-file "${IN_TOTO_LINK_FILES_PATH}/unit-tests.${CI_COMMIT_SHORT_SHA}.link" \
+        -- echo "Unit tests execution wrapper complete"
+  artifacts:
+    paths:
+      - "${IN_TOTO_LINK_FILES_PATH}/"
+    expire_in: 1 week
+
+attest_build_docker_image_job:
+  stage: attest_build_image
+  image: docker:24.0-git
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    DOCKER_TLS_VERIFY: 1
+  script:
+    - echo "Waiting for Docker daemon..."
+    - timeout 30s sh -c 'until docker info; do sleep 1; done'
+    - echo "Building Docker image and creating attestation for $FULL_IMAGE_NAME"
+    - docker build -t $FULL_IMAGE_NAME .
+    - docker inspect $FULL_IMAGE_NAME --format='{{index .RepoDigests 0}}' > "${IN_TOTO_LINK_FILES_PATH}/image.digest"
+    - |
+      in-toto-run \
+        --step-name "build-image" \
+        --key "${BUILD_IMAGE_ACTOR_KEY_FILE_PATH}" \
+        --materials Dockerfile app.py requirements.txt \
+        --products "${IN_TOTO_LINK_FILES_PATH}/image.digest" \
+        --metadata-file "${IN_TOTO_LINK_FILES_PATH}/build-image.${CI_COMMIT_SHORT_SHA}.link" \
+        -- echo "Image built: $FULL_IMAGE_NAME. Digest: $(cat ${IN_TOTO_LINK_FILES_PATH}/image.digest)"
+  artifacts:
+    paths:
+      - "${IN_TOTO_LINK_FILES_PATH}/"
+    expire_in: 1 week
+
+attest_scan_docker_image_job:
+  stage: attest_scan_image
+  image: aquasec/trivy:0.49.1
+  script:
+    - IMAGE_DIGEST_CONTENT=$(cat "${IN_TOTO_LINK_FILES_PATH}/image.digest")
+    - echo "Scanning Docker image by digest ${IMAGE_DIGEST_CONTENT} (corresponds to $FULL_IMAGE_NAME) and creating attestation..."
+    - trivy image --exit-code 0 --severity HIGH,CRITICAL --format table --output "${IN_TOTO_LINK_FILES_PATH}/scan-report.txt" $FULL_IMAGE_NAME
+    - |
+      in-toto-run \
+        --step-name "scan-image" \
+        --key "${SCAN_IMAGE_ACTOR_KEY_FILE_PATH}" \
+        --materials "${IN_TOTO_LINK_FILES_PATH}/image.digest" \
+        --products "${IN_TOTO_LINK_FILES_PATH}/scan-report.txt" \
+        --metadata-file "${IN_TOTO_LINK_FILES_PATH}/scan-image.${CI_COMMIT_SHORT_SHA}.link" \
+        -- echo "Image scanned. Report: scan-report.txt"
+  dependencies:
+    - attest_build_docker_image_job
+  artifacts:
+    paths:
+      - "${IN_TOTO_LINK_FILES_PATH}/"
+    expire_in: 1 week
+
+sign_image_cosign_job:
+  stage: sign_image_cosign
+  image: docker:24.0-git
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    DOCKER_TLS_VERIFY: 1
+  before_script:
+    - apk add --no-cache wget bash
+    - |
+      COSIGN_VERSION="v2.5.0"
+      wget "https://github.com/sigstore/cosign/releases/download/${COSIGN_VERSION}/cosign-linux-amd64" -O /usr/local/bin/cosign
+      chmod +x /usr/local/bin/cosign
+    - echo "Waiting for Docker daemon..."
+    - timeout 30s sh -c 'until docker info; do sleep 1; done'
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin $CI_REGISTRY
+  script:
+    - echo "Signing Docker image $FULL_IMAGE_NAME..."
+    - export COSIGN_PASSWORD="$COSIGN_PASSWORD_VAR"
+    - echo "$COSIGN_PRIVATE_KEY_FILE_CONTENT" > cosign.key
+    - chmod 600 cosign.key
+    - cosign sign -y --key ./cosign.key $FULL_IMAGE_NAME
+    - cosign attest -y --key ./cosign.key --type "https://in-toto.io/Statement/v0.1" --predicate "${SIGNED_LAYOUT_FILE}" $FULL_IMAGE_NAME
+  dependencies:
+    - attest_build_docker_image_job
+    - prepare_layout_job
+    - attest_code_checkout_job
+    - attest_unit_tests_job
+    - attest_scan_docker_image_job
+  needs:
+    - job: attest_build_docker_image_job
+      artifacts: true
+    - job: prepare_layout_job
+      artifacts: true
+    - job: attest_code_checkout_job
+      artifacts: true
+    - job: attest_unit_tests_job
+      artifacts: true
+    - job: attest_scan_docker_image_job
+      artifacts: true
+
+publish_image_and_metadata_job:
+  stage: publish_image_and_metadata
+  image: docker:24.0-git
+  services:
+    - docker:24.0-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+    DOCKER_TLS_VERIFY: 1
+  script:
+    - echo "Waiting for Docker daemon..."
+    - timeout 30s sh -c 'until docker info; do sleep 1; done'
+    - echo "Pushing Docker image $FULL_IMAGE_NAME to GitLab Registry..."
+    - docker push $FULL_IMAGE_NAME
+    - echo "Image pushed."
+    - echo "Final in-toto metadata artifacts are available in ${IN_TOTO_LINK_FILES_PATH}/ and ${SIGNED_LAYOUT_FILE}"
+  dependencies:
+    - prepare_layout_job
+    - attest_checkout_job
+    - attest_unit_tests_job
+    - attest_build_docker_image_job
+    - attest_scan_docker_image_job
+    - sign_image_cosign_job
+  needs:
+    - job: prepare_layout_job
+      artifacts: true
+    - job: attest_checkout_job
+      artifacts: true
+    - job: attest_unit_tests_job
+      artifacts: true
+    - job: attest_build_docker_image_job
+      artifacts: true
+    - job: attest_scan_docker_image_job
+      artifacts: true
+  artifacts:
+    name: "build-and-attestation-artifacts-${CI_COMMIT_REF_NAME}-${CI_COMMIT_SHORT_SHA}"
+    paths:
+      - "${IN_TOTO_LINK_FILES_PATH}/"
+      - "${SIGNED_LAYOUT_FILE}"
+    reports:
+      junit: "${IN_TOTO_LINK_FILES_PATH}/test-results.xml"
+    expire_in: 1 month
+
+deploy_to_k8s_job:
+  stage: deploy
+  image: bitnami/kubectl:latest
+  script:
+    - echo "Starting deployment process for $FULL_IMAGE_NAME..."
+    - echo "Verifying in-toto supply chain integrity..."
+    - cp "${SIGNED_LAYOUT_FILE}" layout.root.layout
+    - mkdir -p intoto_keys_for_verify
+    - cp intoto_keys/*.pub intoto_keys_for_verify/
+    - |
+      in-toto-verify \
+        --layout layout.root.layout \
+        --layout-keys $IN_TOTO_OWNER_PUBLIC_KEY \
+        --key-search-path intoto_keys_for_verify/ \
+        --link-dir "${IN_TOTO_LINK_FILES_PATH}/" \
+        --verbose || (echo "In-toto verification FAILED!" && exit 1)
+    - echo "In-toto verification successful!"
+    - echo "Deploying to Kubernetes cluster..."
+    - export KUBECONFIG=$KUBE_CONFIG_FILE_PATH
+    - sed -i "s|IMAGE_PLACEHOLDER|${FULL_IMAGE_NAME}|g" deployment.yaml
+    - kubectl apply -f deployment.yaml
+    - kubectl rollout status deployment/my-python-app -n default --timeout=60s
+    - echo "Deployment successful!"
+  when: manual
+  allow_failure: false
+  dependencies:
+    - publish_image_and_metadata_job
+  needs:
+    - job: publish_image_and_metadata_job
+      artifacts: true
+

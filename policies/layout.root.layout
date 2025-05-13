@@ -1,0 +1,112 @@
+{
+  "_type": "layout",
+  "expires": "2025-12-31T23:59:59Z",
+  "readme": "Layout for the secure Python web application pipeline.",
+  "keys": {
+    "owner_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_OWNER_PUBLIC_KEY_CONTENT_HERE"}
+    },
+    "checkout_actor_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_CHECKOUT_ACTOR_PUBLIC_KEY_CONTENT_HERE"}
+    },
+    "test_actor_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_TEST_ACTOR_PUBLIC_KEY_CONTENT_HERE"}
+    },
+    "build_image_actor_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_BUILD_IMAGE_ACTOR_PUBLIC_KEY_CONTENT_HERE"}
+    },
+    "scan_image_actor_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_SCAN_IMAGE_ACTOR_PUBLIC_KEY_CONTENT_HERE"}
+    },
+    "sign_image_actor_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_SIGN_IMAGE_ACTOR_PUBLIC_KEY_CONTENT_HERE"}
+    },
+    "publish_actor_pubkey_id_placeholder": {
+      "keytype": "rsa",
+      "scheme": "rsassa-pss-sha256",
+      "keyval": {"public": "YOUR_PUBLISH_ACTOR_PUBLIC_KEY_CONTENT_HERE"}
+    }
+  },
+  "steps": [
+    {
+      "name": "checkout",
+      "expected_materials": [],
+      "expected_products": [
+        ["CREATE", "app.py"],
+        ["CREATE", "requirements.txt"],
+        ["CREATE", "Dockerfile"],
+        ["CREATE", "commit_id.txt"]
+      ],
+      "pubkeys": ["checkout_actor_pubkey_id_placeholder"],
+      "expected_command": ["git", "rev-parse", "HEAD", ">", "commit_id.txt"],
+      "threshold": 1
+    },
+    {
+      "name": "unit-tests",
+      "expected_materials": [
+        ["MATCH", "app.py", "WITH", "PRODUCTS", "FROM", "checkout"],
+        ["MATCH", "requirements.txt", "WITH", "PRODUCTS", "FROM", "checkout"]
+      ],
+      "expected_products": [["CREATE", "test-results.xml"]],
+      "pubkeys": ["test_actor_pubkey_id_placeholder"],
+      "expected_command": ["python", "-m", "unittest", "discover", "-o", "test-results.xml"],
+      "threshold": 1
+    },
+    {
+      "name": "build-image",
+      "expected_materials": [
+        ["MATCH", "Dockerfile", "WITH", "PRODUCTS", "FROM", "checkout"],
+        ["MATCH", "app.py", "WITH", "PRODUCTS", "FROM", "checkout"],
+        ["MATCH", "requirements.txt", "WITH", "PRODUCTS", "FROM", "checkout"]
+      ],
+      "expected_products": [["CREATE", "image.digest"]],
+      "pubkeys": ["build_image_actor_pubkey_id_placeholder"],
+      "expected_command": ["docker", "build", "-t", "IMAGE_NAME_VAR:IMAGE_TAG_VAR", "."],
+      "threshold": 1
+    },
+    {
+      "name": "scan-image",
+      "expected_materials": [
+        ["MATCH", "image.digest", "WITH", "PRODUCTS", "FROM", "build-image"]
+      ],
+      "expected_products": [["CREATE", "scan-report.txt"]],
+      "pubkeys": ["scan_image_actor_pubkey_id_placeholder"],
+      "expected_command": ["trivy", "image", "--exit-code", "0", "--format", "table", "--output", "scan-report.txt", "IMAGE_NAME_VAR:IMAGE_TAG_VAR"],
+      "threshold": 1
+    },
+    {
+      "name": "sign-image",
+      "expected_materials": [
+        ["MATCH", "image.digest", "WITH", "PRODUCTS", "FROM", "build-image"]
+      ],
+      "expected_products": [["CREATE", "image.signed.flag"]], 
+      "pubkeys": ["sign_image_actor_pubkey_id_placeholder"],
+      "expected_command": ["cosign", "sign", "-y", "--key", "env://COSIGN_PRIVATE_KEY_DATA", "IMAGE_NAME_VAR:IMAGE_TAG_VAR"],
+      "threshold": 1
+    },
+    {
+      "name": "publish-artifacts",
+      "expected_materials": [
+        ["MATCH", "image.digest", "WITH", "PRODUCTS", "FROM", "build-image"],
+        ["MATCH", "image.signed.flag", "WITH", "PRODUCTS", "FROM", "sign-image"]
+      ],
+      "expected_products": [["CREATE", "publish.receipt"]], 
+      "pubkeys": ["publish_actor_pubkey_id_placeholder"],
+      "expected_command": ["docker", "push", "IMAGE_NAME_VAR:IMAGE_TAG_VAR"],
+      "threshold": 1
+    }
+  ],
+  "inspect": []
+}

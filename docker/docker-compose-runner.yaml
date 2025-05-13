@@ -1,0 +1,21 @@
+version: '3.9'
+services:
+  gitlab-runner:
+    container_name: gitlab-runner
+    image: gitlab/gitlab-runner:latest
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+      - ./config.toml:/etc/gitlab-runner/config.toml
+      - ./ca.crt:/etc/gitlab-runner/certs/ca.crt
+    environment:
+      - CI_SERVER_URL=https://gitlab.infra.local/ci
+    extra_hosts:
+      - "gitlab.infra.local:172.20.0.10"
+    networks:
+      infra_network:
+        ipv4_address: 172.20.0.11
+
+networks:
+  infra_network:
+    external: true

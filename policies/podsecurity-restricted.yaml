@@ -1,0 +1,20 @@
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: podsecurity-restricted-profile
+spec:
+  validationFailureAction: Enforce
+  background: false
+  rules:
+  - name: restricted-pss-latest
+    match:
+      any:
+      - resources:
+          kinds:
+          - Pod
+    validate:
+      message: "Pod creation violates the Restricted Pod Security Standard. Check Pod Security Admission controller logs for details."
+      podSecurity:
+        profile: restricted
+        version: latest
+
